@@ -23,7 +23,7 @@ from .data.calibration import (
 from .data.contract import validate_session
 from .data.ingestion import RawSession, load_session
 from .data.labels import events_to_window_labels, load_events
-from .data.quality import check_window
+from .data.quality import check_timestamps, check_window
 from .data.resampling import make_grid, mic_envelope, resample_linear
 from .data.windowing import Window, make_windows
 from .features.assemble import window_features
@@ -89,6 +89,11 @@ def process_session(session_dir: str | Path,
 
     raw = load_session(session_dir, sensors)
     validate_session(raw, sensors)  # fail loud on contract violations
+
+    # dropout check on the native streams before resampling hides gaps via interpolation
+    # (surfaced as a per-stream warning; doesn't abort the session on its own)
+    for stream, t in (("strain", raw.strain_t_ms), ("mic", raw.mic_t_ms), ("imu", raw.imu_t_ms)):
+        check_timestamps(t, pipeline, stream)
 
     grid, frames, mic_pa = _unified_frames(raw, sensors, pipeline)
     windows = make_windows(grid, frames, pipeline)
