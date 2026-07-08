@@ -1,0 +1,22 @@
+# End-to-end signal pipeline configuration.
+
+resampling:
+  target_grid_hz: 200.0     # unified window grid all channels are resampled onto
+  method: linear            # linear for strain/imu; mic handled separately in features
+
+calibration:
+  drift:
+    method: ema             # exponential moving average baseline removal
+    alpha: 0.001            # per-sample EMA coefficient on the unified grid
+    baseline_window_s: 2.0  # initial quiet window used to seed the baseline
+
+quality:
+  max_nan_fraction: 0.02
+  saturation_adc_high: 65000
+  saturation_adc_low: 100
+  max_dropout_ms: 250
+  reject_on_fail: true      # fail-loud: drop the window/segment rather than pass bad data
+
+windowing:
+  window_s: 2.0
+  overlap: 0.5              # 50% -> 1 s hop; one window == one LSTM timestep

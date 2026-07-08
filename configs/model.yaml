@@ -1,0 +1,33 @@
+# Model + training configuration.
+
+model:
+  cnn:
+    in_channels: 16          # 8 strain + 2 mic-envelope + 6 imu on the unified grid
+    channels: [32, 64, 64]
+    kernel_size: 5
+    embedding_dim: 128
+  hand_feature_dim: 130      # produced by features.assemble (FEATURE_DIM is authoritative)
+  fusion_dim: 128
+  lstm:
+    hidden_size: 128
+    num_layers: 2
+    bidirectional: true
+    dropout: 0.2
+  heads:
+    num_classes: 3           # silence / suck / swallow
+    volume: true
+    sequence_labeling: false # prototype only — see models/heads.py
+
+training:
+  batch_size: 16             # sessions per batch (variable-length, padded)
+  lr: 0.0003
+  weight_decay: 0.0001
+  epochs_synthetic: 40
+  epochs_finetune: 20
+  seed: 1337
+  loss_weights:
+    classification: 1.0
+    volume: 1.0
+  # Classifier is trained only where per-event labels exist.
+  # On real data today that means synthetic-only until events.csv arrives.
+  require_event_labels_for_classifier: true

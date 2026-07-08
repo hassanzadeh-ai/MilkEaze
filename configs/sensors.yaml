@@ -1,0 +1,46 @@
+# MilkEaze sensor schema (16 model channels + scale ground truth).
+# Reconciled from the RuthV0/scale-vac-ramp data contract.
+# NOTE: strain currently reads ~19 Hz effective vs 43.5 nominal — confirm with Steve.
+
+sample_rates_hz:
+  strain: 19.0        # effective; nominal 43.5 — under confirmation
+  imu: 416.0          # LSM6DSOX ODR
+  mic: 8000.0         # MP34DT01-M (schema doc previously said ICS-43434/16k — wrong)
+
+strain:
+  # Radial = bend, Arc = stretch. 8 channels total.
+  bend:               # 4 channels
+    - {name: radial_N, adc_channel: 0}
+    - {name: radial_E, adc_channel: 1}
+    - {name: radial_S, adc_channel: 2}
+    - {name: radial_W, adc_channel: 3}
+  stretch:            # 4 channels
+    - {name: arc_inner_E, adc_channel: 4}
+    - {name: arc_outer_E, adc_channel: 5}
+    - {name: arc_inner_W, adc_channel: 6}
+    - {name: arc_outer_W, adc_channel: 7}
+  adc:
+    bits: 16
+    v_ref: 3.3
+    r_ref_ohm: 10000.0   # reference resistor in the divider
+    gain: 1.0
+
+mic:
+  channels: [mic_L, mic_R]   # ~180 deg apart
+  # MP34DT01-M PDM mic; Pa conversion factor still TBD — see calibration.py
+  sensitivity_dbfs: -26.0
+
+imu:
+  model: LSM6DSOX
+  accel_channels: [acc_x, acc_y, acc_z]   # -> m/s^2
+  gyro_channels: [gyr_x, gyr_y, gyr_z]    # -> deg/s
+  accel_fs_g: 4.0
+  gyro_fs_dps: 500.0
+
+# Ground truth — NOT a model input.
+scale:
+  channel: scale_g
+  resolution_g: 0.01
+  units: grams
+
+classes: [silence, suck, swallow]

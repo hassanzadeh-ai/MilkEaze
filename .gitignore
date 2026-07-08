@@ -1,0 +1,32 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.eggs/
+build/
+dist/
+.venv/
+venv/
+env/
+
+# Data & artifacts (never commit raw sessions or trained weights)
+data/
+datasets/
+*.bin
+*.wav
+*.csv
+!tests/**/*.csv
+checkpoints/
+runs/
+*.ckpt
+*.pt
+*.pth
+
+# Notebooks / scratch
+*.ipynb
+scratch/
+
+# OS / IDE
+.DS_Store
+.idea/
+.vscode/
