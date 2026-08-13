@@ -9,9 +9,13 @@ dist/
 venv/
 env/
 
-# Data & artifacts (never commit raw sessions or trained weights)
-data/
-datasets/
+# Data & artifacts (never commit raw sessions or trained weights).
+# These are anchored with a leading slash on purpose: an unanchored `data/` also
+# matches `milkeaze/data/`, which silently kept the whole ingestion package out of
+# version control even though the pipeline imports it.
+/data/
+/datasets/
+/new_dataset/
 *.bin
 *.wav
 *.csv
