@@ -37,7 +37,15 @@ class SensorConfig:
         return [c["name"] for c in s["bend"]] + [c["name"] for c in s["stretch"]]
 
     def mic_channel_names(self) -> list[str]:
+        """The frozen model contract: every mic slot, working or not."""
         return list(self.raw["mic"]["channels"])
+
+    def mic_active_channels(self) -> list[str]:
+        """Mic channels actually read from disk; the rest are zero-filled.
+
+        Defaults to every channel, so a config without the key behaves as before.
+        """
+        return list(self.raw["mic"].get("active_channels", self.raw["mic"]["channels"]))
 
     def imu_channel_names(self) -> list[str]:
         imu = self.raw["imu"]

@@ -1,14 +1,19 @@
 # MilkEaze sensor schema (16 model channels + scale ground truth).
-# Reconciled from the RuthV0/scale-vac-ramp data contract.
-# NOTE: strain currently reads ~19 Hz effective vs 43.5 nominal — confirm with Steve.
+# Reconciled against the 20260718 ring-mounted capture and Steve's Jul 30 confirmations.
+
+schema_version: 2
 
 sample_rates_hz:
-  strain: 19.0        # effective; nominal 43.5 — under confirmation
-  imu: 416.0          # LSM6DSOX ODR
-  mic: 8000.0         # MP34DT01-M (schema doc previously said ICS-43434/16k — wrong)
+  strain: 82.0        # measured on the 20260718 ring capture (was 19 Hz pre-rev)
+  imu: 416.0          # LSM6DSOX ODR; measures ~435 Hz effective
+  mic: 8000.0         # MP34DT01-M
 
 strain:
   # Radial = bend, Arc = stretch. 8 channels total.
+  # Channel names are LEGACY and may not match physical positions — Steve flagged a
+  # naming artifact on Jul 30 and owes a corrected map. Do not draw per-channel
+  # conclusions (which position is loudest, which is faulty) until it lands.
+  channel_map_verified: false
   bend:               # 4 channels
     - {name: radial_N, adc_channel: 0}
     - {name: radial_E, adc_channel: 1}
@@ -20,15 +25,26 @@ strain:
     - {name: arc_inner_W, adc_channel: 6}
     - {name: arc_outer_W, adc_channel: 7}
   adc:
-    bits: 16
-    v_ref: 3.3
-    r_ref_ohm: 10000.0   # reference resistor in the divider
-    gain: 1.0
+    bits: 24                 # signed; full scale is 2^23
+    # bend and stretch sit on different references and topologies
+    bend:
+      v_ref: 2.048           # differential vs the ADC's internal reference
+      r_ref_ohm: 4700.0
+    stretch:
+      v_ref: 3.3             # sensor high side, R_ref to GND
+      r_ref_ohm: 1500.0      # R_sensor = R_ref * (Vref - V) / V
 
 mic:
-  channels: [mic_L, mic_R]   # ~180 deg apart
-  # MP34DT01-M PDM mic; Pa conversion factor still TBD — see calibration.py
+  # `channels` is the frozen MODEL contract: the 16-channel input keeps a 2-mic slot.
+  # The second MP34DT01-M has a known fault and emits garbage, so only `active_channels`
+  # are read from disk; the rest are zero-filled. Holding the slot means the trained
+  # model shape survives the second mic being fixed, instead of forcing a retrain.
+  channels: [mic_L, mic_R]
+  active_channels: [mic_L]
+  faulty_channels: [mic_R]   # Steve, Jul 30 — drop channel 2, treat capture as mono
+  model: MP34DT01-M
   sensitivity_dbfs: -26.0
+  pa_per_count: 6.09e-4      # Steve, Jul 30: p_Pa = counts * 6.09e-4 (FS 32768)
 
 imu:
   model: LSM6DSOX
@@ -36,6 +52,18 @@ imu:
   gyro_channels: [gyr_x, gyr_y, gyr_z]    # -> deg/s
   accel_fs_g: 4.0
   gyro_fs_dps: 500.0
+  accel_ms2_per_count: 0.00059820565
+  gyro_dps_per_count: 0.00875
+
+# Rig board — instrumentation, NOT a model input. Pressure is the label source.
+rig:
+  pressure:
+    part: ABP2MRRT015PD2A3XX
+    units: psi
+    sign_convention: suction reads negative
+  temperature:
+    part: TMP117
+    role: rig ambient
 
 # Ground truth — NOT a model input.
 scale:

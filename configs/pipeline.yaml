@@ -12,10 +12,15 @@ calibration:
 
 quality:
   max_nan_fraction: 0.02
-  saturation_adc_high: 65000
-  saturation_adc_low: 100
   max_dropout_ms: 250
   reject_on_fail: true      # fail-loud: drop the window/segment rather than pass bad data
+  # Rail limits are per stream because the converters differ, and they are in ADC
+  # counts, so this is checked at ingestion — after calibration a railed strain channel
+  # and a legitimate 9.8 m/s^2 reading are indistinguishable.
+  saturation:
+    strain: {low: -8300000, high: 8300000}   # 24-bit signed, full scale +/- 2^23
+    mic:    {low: -32000,   high: 32000}     # 16-bit signed PCM
+    imu:    {low: -32000,   high: 32000}
 
 windowing:
   window_s: 2.0
