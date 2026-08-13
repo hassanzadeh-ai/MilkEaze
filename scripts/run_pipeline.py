@@ -28,11 +28,13 @@ log = get_logger("run_pipeline")
 def main() -> None:
     ap = argparse.ArgumentParser()
     ap.add_argument("--session", type=str, required=True)
+    ap.add_argument("--stem", type=str, default=None,
+                    help="capture stem, when the directory holds several (rig layout)")
     ap.add_argument("--checkpoint", type=str, default=None)
     ap.add_argument("--device", type=str, default="cpu")
     args = ap.parse_args()
 
-    proc = process_session(args.session)
+    proc = process_session(args.session, stem=args.stem)
     log.info("windows=%d frames=%s hand=%s has_volume=%s has_labels=%s",
              len(proc.windows), proc.frames.shape, proc.hand.shape,
              proc.volume is not None, proc.labels is not None)
@@ -43,7 +45,8 @@ def main() -> None:
         model = MilkEazeNet(dims).to(args.device)
         state = torch.load(args.checkpoint, map_location=args.device, weights_only=False)
         model.load_state_dict(state["model_state"])
-        result = predict_session(model, proc.frames, proc.hand, device=args.device)
+        result = predict_session(model, proc.frames, proc.hand, device=args.device,
+                                 overlap_correction=proc.volume_overlap_correction)
         log.info("SESSION SUMMARY: %s", result.summary())
 
 

@@ -83,7 +83,7 @@ def write_session(out_dir: str | Path, duration_s: float = 180.0, total_ml: floa
         "session_id": out.name,
         "mic_model": "MP34DT01-M",
         "sample_rates_hz": {k: float(v) for k, v in rates.items()},
-        "adc_vref": sensors.raw["strain"]["adc"]["v_ref"],
+        "adc": sensors.raw["strain"]["adc"],
         "mounting": "ring",
     }
     (out / "meta.json").write_text(json.dumps(meta, indent=2), encoding="utf-8")

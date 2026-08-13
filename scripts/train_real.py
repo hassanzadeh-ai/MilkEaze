@@ -17,6 +17,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 import torch
 
 from milkeaze.config import ModelConfig
+from milkeaze.data.rig_session import discover_stems
 from milkeaze.features.assemble import FEATURE_DIM
 from milkeaze.models import MilkEazeNet, ModelDims
 from milkeaze.pipeline import process_session
@@ -25,6 +26,18 @@ from milkeaze.training.train import finetune_real
 from milkeaze.utils.logging import get_logger
 
 log = get_logger("train_real")
+
+
+def _iter_sessions(root: Path) -> list[tuple[Path, str | None]]:
+    """Yield ``(directory, stem)`` pairs for every session under ``root``.
+
+    A rig-layout directory holds several captures side by side rather than one per
+    subdirectory, so it is enumerated by stem instead of by folder.
+    """
+    stems = discover_stems(root)
+    if stems:
+        return [(root, stem) for stem in stems]
+    return [(d, None) for d in sorted(root.iterdir()) if d.is_dir()]
 
 
 def main() -> None:
@@ -41,13 +54,12 @@ def main() -> None:
     model.load_state_dict(state["model_state"])
 
     samples: list[SessionSample] = []
-    for session_dir in sorted(Path(args.data_root).iterdir()):
-        if not session_dir.is_dir():
-            continue
+    for session_dir, stem in _iter_sessions(Path(args.data_root)):
+        name = stem or session_dir.name
         try:
-            proc = process_session(session_dir)
+            proc = process_session(session_dir, stem=stem)
         except Exception as exc:  # fail loud per-session, keep going
-            log.error("skipping %s: %s", session_dir.name, exc)
+            log.error("skipping %s: %s", name, exc)
             continue
         samples.append(SessionSample(frames=proc.frames, hand=proc.hand,
                                      labels=proc.labels, volume=proc.volume))

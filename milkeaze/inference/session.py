@@ -25,11 +25,19 @@ class SessionResult:
 
 
 def aggregate_session(class_logits: np.ndarray, volume_pred: np.ndarray,
-                      min_swallow_prob: float = 0.5) -> SessionResult:
+                      min_swallow_prob: float = 0.5,
+                      overlap_correction: float = 1.0) -> SessionResult:
     """
-    class_logits : (seq, num_classes)
-    volume_pred  : (seq,) mL per window
+    class_logits       : (seq, num_classes)
+    volume_pred        : (seq,) mL per window
+    overlap_correction : hop / window length, since each window predicts the volume
+                         over its own full span and overlapping windows re-cover the
+                         same milk. At the default 50% overlap this is 0.5; leaving it
+                         at 1.0 reports twice the milk actually transferred.
     """
+    if not 0.0 < overlap_correction <= 1.0:
+        raise ValueError(f"overlap_correction must be in (0, 1], got {overlap_correction}")
+
     probs = _softmax(class_logits, axis=-1)
     pred_class = probs.argmax(axis=-1)
 
@@ -42,7 +50,8 @@ def aggregate_session(class_logits: np.ndarray, volume_pred: np.ndarray,
         else float(np.sum(volume_pred))
 
     return SessionResult(
-        suck_count=suck, swallow_count=swallow, total_volume_ml=total_volume,
+        suck_count=suck, swallow_count=swallow,
+        total_volume_ml=total_volume * overlap_correction,
         per_window_class=pred_class, per_window_volume_ml=np.asarray(volume_pred),
     )
 

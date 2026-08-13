@@ -18,12 +18,13 @@ import numpy as np
 
 from .config import PipelineConfig, SensorConfig
 from .data.calibration import (
-    ema_drift_removal, imu_counts_to_physical, mic_pcm_to_pa, strain_counts_to_resistance,
+    COUNTS, ema_drift_removal, imu_counts_to_physical, mic_pcm_to_pa,
+    strain_counts_to_resistance,
 )
 from .data.contract import validate_session
 from .data.ingestion import RawSession, load_session
 from .data.labels import events_to_window_labels, load_events
-from .data.quality import check_timestamps, check_window
+from .data.quality import check_saturation, check_timestamps, check_window
 from .data.resampling import make_grid, mic_envelope, resample_linear
 from .data.windowing import Window, make_windows
 from .features.assemble import window_features
@@ -43,6 +44,18 @@ class ProcessedSession:
     labels: np.ndarray | None     # (seq,) class targets or None
     volume: np.ndarray | None     # (seq,) mL/window target or None
     grid_hz: float
+    window_s: float = 2.0
+    hop_s: float = 1.0
+
+    @property
+    def volume_overlap_correction(self) -> float:
+        """Factor for turning summed per-window volume into a session total.
+
+        Each window's target is the milk transferred over its own full span, so with
+        50% overlap consecutive windows both claim the same second of milk. Summing
+        them without this factor reports double the truth.
+        """
+        return self.hop_s / self.window_s
 
 
 def _unified_frames(session: RawSession, sensors: SensorConfig, pipeline: PipelineConfig):
@@ -51,9 +64,9 @@ def _unified_frames(session: RawSession, sensors: SensorConfig, pipeline: Pipeli
     t1 = min(session.strain_t_ms[-1], session.imu_t_ms[-1], session.mic_t_ms[-1])
     grid = make_grid(t0, t1, grid_hz)
 
-    strain_phys = strain_counts_to_resistance(session.strain, sensors)
-    imu_phys = imu_counts_to_physical(session.imu, sensors)
-    mic_pa = mic_pcm_to_pa(session.mic, sensors)
+    strain_phys = strain_counts_to_resistance(session.strain, sensors, session.unit_of("strain"))
+    imu_phys = imu_counts_to_physical(session.imu, sensors, session.unit_of("imu"))
+    mic_pa = mic_pcm_to_pa(session.mic, sensors, session.unit_of("mic"))
 
     strain_grid = resample_linear(session.strain_t_ms, strain_phys, grid)      # (n, 8)
     imu_grid = resample_linear(session.imu_t_ms, imu_phys, grid)                # (n, 6)
@@ -66,6 +79,18 @@ def _unified_frames(session: RawSession, sensors: SensorConfig, pipeline: Pipeli
 
     frames = np.concatenate([strain_grid, mic_env, imu_grid], axis=1)  # (n, 16)
     return grid, frames, mic_pa
+
+
+def _inactive_channels(sensors: SensorConfig) -> list[int]:
+    """Indices in the unified frame that are zero-filled by configuration.
+
+    Frame layout is [strain | mic | imu], so a mic slot held open for the faulty second
+    microphone sits just past the strain block.
+    """
+    offset = len(sensors.strain_channel_names())
+    contract = sensors.mic_channel_names()
+    active = set(sensors.mic_active_channels())
+    return [offset + i for i, name in enumerate(contract) if name not in active]
 
 
 def _window_volume_targets(session: RawSession, windows: list[Window]) -> np.ndarray | None:
@@ -83,17 +108,27 @@ def _window_volume_targets(session: RawSession, windows: list[Window]) -> np.nda
 def process_session(session_dir: str | Path,
                     sensors: SensorConfig | None = None,
                     pipeline: PipelineConfig | None = None,
-                    strict: bool = True) -> ProcessedSession:
+                    strict: bool = True,
+                    stem: str | None = None) -> ProcessedSession:
+    """Turn one on-disk session into per-window tensors.
+
+    ``stem`` picks a single capture out of a rig-layout directory that holds several.
+    """
     sensors = sensors or SensorConfig.load()
     pipeline = pipeline or PipelineConfig.load()
 
-    raw = load_session(session_dir, sensors)
+    raw = load_session(session_dir, sensors, stem=stem)
     validate_session(raw, sensors)  # fail loud on contract violations
 
     # dropout check on the native streams before resampling hides gaps via interpolation
     # (surfaced as a per-stream warning; doesn't abort the session on its own)
     for stream, t in (("strain", raw.strain_t_ms), ("mic", raw.mic_t_ms), ("imu", raw.imu_t_ms)):
         check_timestamps(t, pipeline, stream)
+
+    # saturation is an ADC-count concept, so it has to be checked before calibration
+    for stream, values in (("strain", raw.strain), ("mic", raw.mic)):
+        if raw.unit_of(stream) == COUNTS:
+            check_saturation(values, pipeline, stream)
 
     grid, frames, mic_pa = _unified_frames(raw, sensors, pipeline)
     windows = make_windows(grid, frames, pipeline)
@@ -104,12 +139,14 @@ def process_session(session_dir: str | Path,
     strain_fs = pipeline.target_grid_hz
     imu_fs = pipeline.target_grid_hz
 
+    inactive = _inactive_channels(sensors)
+
     frame_stack = np.empty((len(windows), frames.shape[1], windows[0].frames.shape[0]),
                            dtype=np.float32)
     hand_stack = []
     kept: list[Window] = []
     for w in windows:
-        q = check_window(w.frames, pipeline)
+        q = check_window(w.frames, pipeline, ignore_channels=inactive)
         if not q.ok and strict:
             log.debug("dropping window %d: %s", w.index, q.reasons)
             continue
@@ -132,12 +169,23 @@ def process_session(session_dir: str | Path,
     volume = _window_volume_targets(raw, kept)
 
     labels = None
-    events = load_events(session_dir)
+    events = load_events(session_dir, stem=raw.session_id)
     if events is not None:
         labels = events_to_window_labels(events, kept, sensors)
 
-    log.info("processed session %s: %d windows kept", raw.session_id, len(kept))
-    return ProcessedSession(
+    processed = ProcessedSession(
         session_id=raw.session_id, frames=frame_stack, hand=hand, windows=kept,
         labels=labels, volume=volume, grid_hz=pipeline.target_grid_hz,
+        window_s=pipeline.window_s, hop_s=pipeline.hop_s,
     )
+
+    log.info("processed session %s: %d windows kept", raw.session_id, len(kept))
+    if volume is not None and raw.has_scale and raw.scale_g.size:
+        # cross-check the window targets against the scale before anything trains on them
+        reconstructed = float(volume.sum()) * processed.volume_overlap_correction
+        measured = float(raw.scale_g[-1] - raw.scale_g[0]) / MILK_DENSITY_G_PER_ML
+        log.info("volume targets: %.1f mL reconstructed vs %.1f mL on the scale (%.1f%%)",
+                 reconstructed, measured,
+                 100.0 * reconstructed / measured if measured else float("nan"))
+
+    return processed
