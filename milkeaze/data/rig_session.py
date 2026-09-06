@@ -365,6 +365,34 @@ def _to_session_ms(capture: RigCapture, board: str, device_ts_us: np.ndarray,
     return repaired
 
 
+def fill_dropped_strain(block: np.ndarray) -> np.ndarray:
+    """Interpolate across dropped strain samples, which arrive as exact zeros.
+
+    A dropped sample is written as ``0``, which is not a reading any channel produces in
+    normal operation, so the zeros are unambiguous. Two consumers need different things
+    from them and both are served here: feature extraction reads amplitudes with
+    NaN-aware quantiles and could simply mask the gaps, but event detection band-passes
+    with a zero-phase filter, where a single NaN propagates to the whole output. The
+    gaps are short and sparse enough that linear interpolation across them is honest.
+
+    A channel with fewer than two real samples is returned as zeros, so it fails the
+    in-band power check downstream rather than producing a spurious cycle.
+    """
+    out = np.array(block, dtype=np.float64, copy=True)
+    if out.ndim != 2:
+        raise ValueError(f"block must be (n_time, n_channels), got {out.shape}")
+    out[out == 0.0] = np.nan
+
+    index = np.arange(out.shape[0], dtype=np.float64)
+    for col in range(out.shape[1]):
+        good = np.isfinite(out[:, col])
+        if good.sum() < 2:
+            out[:, col] = 0.0
+        else:
+            out[:, col] = np.interp(index, index[good], out[good, col])
+    return out
+
+
 def _strain_columns(df: pd.DataFrame, sensors: SensorConfig) -> list[str]:
     """Match ``ch<i>_<Name>`` CSV columns to the configured channel order."""
     by_index: dict[int, str] = {}

@@ -5,15 +5,29 @@ Lauren's sessions have no rig board, so unless cycles can be recovered from the 
 pipeline has nothing to segment on at home and the volume integration has no periods to
 multiply by.
 
-Scored against the pressure detector as reference, on the same support window, per run.
-Both polarity hypotheses are scored because the physical channel map is still unverified
-and a suck may deflect a given channel either way; guessing lands on F1 near 1 or near 0
-with nothing between, so the winner is reported rather than assumed.
+The blocker used to be the channel polarity. Whether suction deflects a given channel
+positive or negative depends on the physical channel map, and the sign is not
+identifiable from strain alone — a roughly sinusoidal cycle has an equally steady period
+either way up, and the two hypotheses differ by half a cycle, so guessing lands on F1
+near 1 or near 0 with nothing in between. Choosing by period steadiness, the only signal
+available without a reference, picked the matching polarity on 18% of runs.
+
+It did not need bench time after all. The 34 captures here carry pressure-derived
+reference events, and the sign that matches the reference *is* the sign. This script
+sweeps all eight channels against both hypotheses over the whole batch, which turns the
+polarity from a per-run coin flip into a measured constant — see
+:data:`milkeaze.eval.baselines.STRAIN_POLARITY`, which this script is the source of.
+
+It then scores the detector that would actually ship: a consensus over whichever
+channels are carrying rhythm, which needs no named channel and degrades as channels fail
+rather than stopping. That last property is the point, given that bend-sensor channels
+have been failing after the silicone overmold.
 """
 from __future__ import annotations
 
 import argparse
 import sys
+from dataclasses import dataclass
 from pathlib import Path
 
 import numpy as np
@@ -21,10 +35,14 @@ import pandas as pd
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
-from milkeaze.data.pressure_events import DetectorConfig  # noqa: E402
-from milkeaze.data.rig_session import SENSOR_BOARD, discover_stems, open_capture  # noqa: E402
-from milkeaze.eval.baselines import strain_event_candidates  # noqa: E402
-from milkeaze.eval.events import match_events, rate_cpm, tolerance_from_period  # noqa: E402
+from milkeaze.data.pressure_events import DetectorConfig, detect_suck_events  # noqa: E402
+from milkeaze.data.rig_session import (  # noqa: E402
+    SENSOR_BOARD, discover_stems, fill_dropped_strain, open_capture,
+)
+from milkeaze.eval.baselines import strain_consensus_events  # noqa: E402
+from milkeaze.eval.events import (  # noqa: E402
+    EventMatch, match_events, rate_cpm, tolerance_from_period,
+)
 from milkeaze.utils.logging import get_logger  # noqa: E402
 
 log = get_logger("strain_events")
@@ -32,175 +50,292 @@ log = get_logger("strain_events")
 STRAIN_CHANNELS = ["Radial_1", "Radial_2", "Radial_3", "Radial_4",
                    "Arc_2_in", "Arc_2_out", "Arc_4_in", "Arc_4_out"]
 
+SIGNS = (1.0, -1.0)
 
-def _reference_events(root: Path, stem: str) -> pd.DataFrame:
+#: A run needs this many reference events before it is worth scoring; below it the
+#: period estimate that sets the matching tolerance is itself unreliable.
+MIN_REFERENCE_EVENTS = 20
+
+CONSENSUS = "consensus"
+
+
+@dataclass
+class Run:
+    stem: str
+    level: int
+    cpm: float
+    t_ms: np.ndarray                 # strain timestamps, host-mono ms
+    block: np.ndarray                # (n_time, 8), dropped samples interpolated
+    ref_t_ms: np.ndarray             # pressure reference events, host-mono ms
+    ref_depth_psi: np.ndarray        # suction depth of each reference event
+
+
+@dataclass
+class Score:
+    stem: str
+    level: int
+    channel: str
+    sign: float
+    f1: float
+    precision: float
+    recall: float
+    count_err_pct: float
+    bias_ms: float
+    mad_ms: float
+    pred_rate_cpm: float
+    ref_rate_cpm: float
+
+
+def _load(root: Path, stem: str) -> Run | None:
+    capture = open_capture(root, stem)
+    clock = capture.clocks[SENSOR_BOARD]
+
     events = pd.read_csv(root / f"{stem}_events.csv")
     ok = events["quality"].astype(str).str.strip() == "ok"
-    return events.loc[ok, ["t_ms", "depth_psi"]].sort_values("t_ms").reset_index(drop=True)
+    reference = events.loc[ok].sort_values("t_ms")
+    if len(reference) < MIN_REFERENCE_EVENTS:
+        log.warning("%s: %d reference events, skipping", stem, len(reference))
+        return None
 
+    ref_t = reference["t_ms"].to_numpy(np.float64)
+    depth = (reference["depth_psi"].to_numpy(np.float64)
+             if "depth_psi" in reference else np.full(ref_t.size, np.nan))
 
-def _strain_block(root: Path, stem: str, capture) -> tuple[np.ndarray, np.ndarray]:
-    frame = pd.read_csv(root / f"{stem}_sensor_strain.csv",
-                        usecols=["scan_t_us", *STRAIN_CHANNELS])
-    t_ms = capture.clocks[SENSOR_BOARD].to_host_s(
-        frame["scan_t_us"].to_numpy(np.float64)) * 1000.0
-    block = frame[STRAIN_CHANNELS].to_numpy(np.float64)
+    strain = pd.read_csv(root / f"{stem}_sensor_strain.csv",
+                         usecols=["scan_t_us", *STRAIN_CHANNELS])
+    t_ms = clock.to_host_s(strain["scan_t_us"].to_numpy(np.float64)) * 1000.0
+    block = strain[STRAIN_CHANNELS].to_numpy(np.float64)
 
     order = np.argsort(t_ms)
     t_ms, block = t_ms[order], block[order]
+    unique = np.concatenate(([True], np.diff(t_ms) > 0))
+    t_ms, block = t_ms[unique], block[unique]
 
-    # zeros are dropped samples in this format; carry the last good value forward so the
-    # detector sees a continuous trace rather than spikes to zero
-    block[block == 0.0] = np.nan
-    frame = pd.DataFrame(block).ffill().bfill()
-    return t_ms, frame.to_numpy(np.float64)
+    # score on the window the reference covers, so strain is not penalised for cycles
+    # during the fill transient and drain tail where no reference events exist; one
+    # period of margin keeps a cycle at either end from being clipped mid-detection
+    period_ms = float(np.median(np.diff(ref_t)))
+    span = (t_ms >= ref_t[0] - period_ms) & (t_ms <= ref_t[-1] + period_ms)
+    if span.sum() < 500:
+        log.warning("%s: only %d strain samples in the reference window", stem,
+                    int(span.sum()))
+        return None
+
+    return Run(
+        stem=stem,
+        level=int(capture.vacuum_level),
+        cpm=float(capture.cycle_rate_cpm or np.nan),
+        t_ms=t_ms[span],
+        block=fill_dropped_strain(block[span]),
+        ref_t_ms=ref_t,
+        ref_depth_psi=depth,
+    )
+
+
+def _score_pred(run: Run, pred: np.ndarray, channel: str,
+                sign: float) -> tuple[Score, EventMatch] | None:
+    inside = (pred >= run.ref_t_ms[0]) & (pred <= run.ref_t_ms[-1])
+    pred = pred[inside]
+    if pred.size == 0:
+        return None
+
+    m = match_events(pred, run.ref_t_ms, tolerance_from_period(run.ref_t_ms))
+    return Score(
+        stem=run.stem, level=run.level, channel=channel, sign=sign,
+        f1=m.f1, precision=m.precision, recall=m.recall,
+        count_err_pct=m.count_error_pct, bias_ms=m.bias_ms, mad_ms=m.mad_ms,
+        pred_rate_cpm=rate_cpm(pred), ref_rate_cpm=rate_cpm(run.ref_t_ms),
+    ), m
+
+
+def _score_channel(run: Run, index: int, sign: float,
+                   config: DetectorConfig) -> Score | None:
+    channel = STRAIN_CHANNELS[index]
+    centred = run.block[:, index] - run.block[:, index].mean()
+    try:
+        found = detect_suck_events(run.t_ms, sign * centred, config)
+    except ValueError as exc:
+        log.debug("%s %s sign=%+.0f: %s", run.stem, channel, sign, exc)
+        return None
+    if found.n_events == 0:
+        return None
+
+    scored = _score_pred(run, found.events["t_ms"].to_numpy(np.float64), channel, sign)
+    return None if scored is None else scored[0]
+
+
+def _score_consensus(run: Run, channels: list[str], label: str,
+                     config: DetectorConfig) -> tuple[Score, EventMatch] | None:
+    keep = [STRAIN_CHANNELS.index(name) for name in channels]
+    try:
+        found = strain_consensus_events(run.t_ms, run.block[:, keep], channels, config)
+    except ValueError as exc:
+        log.debug("%s consensus %s: %s", run.stem, label, exc)
+        return None
+    if found.n_events == 0:
+        return None
+    return _score_pred(run, found.events["t_ms"].to_numpy(np.float64), label, 0.0)
+
+
+def _table(scores: list[Score]) -> pd.DataFrame:
+    return pd.DataFrame([s.__dict__ for s in scores])
+
+
+def _summarise(df: pd.DataFrame, by: list[str]) -> pd.DataFrame:
+    """Median over runs, because a single failed run should not set the headline.
+
+    Ranked on F1 and then on timing spread: the leading channels tie at F1 0.998, so
+    counting accuracy alone cannot separate them and per-event timing decides.
+    """
+    out = df.groupby(by, dropna=False).agg(
+        n_runs=("f1", "size"),
+        f1=("f1", "median"),
+        worst_f1=("f1", "min"),
+        abs_count_err_pct=("count_err_pct", lambda s: float(np.median(np.abs(s)))),
+        count_err_pct=("count_err_pct", "median"),
+        bias_ms=("bias_ms", "median"),
+        mad_ms=("mad_ms", "median"),
+    )
+    return out.sort_values(["f1", "mad_ms"], ascending=[False, True])
+
+
+def _report_polarity(df: pd.DataFrame) -> None:
+    print("\n=== is the polarity a measured constant, or a per-run coin flip? ===")
+    print("  a channel whose losing sign scores F1 0.000 while still counting the right")
+    print("  number of cycles is exactly half a cycle out, which is the expected failure\n")
+    for channel in STRAIN_CHANNELS:
+        sub = df[df["channel"] == channel]
+        if sub.empty:
+            continue
+        winners = sub.loc[sub.groupby("stem")["f1"].idxmax()]
+        losers = sub.loc[sub.groupby("stem")["f1"].idxmin()]
+        negative = int((winners["sign"] < 0).sum())
+        # the detector finds troughs, so a winning sign of -1 means suction deflects the
+        # channel positive
+        reads = "positive" if negative > len(winners) / 2 else "negative"
+        print(f"  {channel:12s} suction reads {reads:8s} on "
+              f"{max(negative, len(winners) - negative):2d}/{len(winners):2d} runs   "
+              f"winner F1 {winners['f1'].median():.3f}   "
+              f"loser F1 {losers['f1'].median():.3f}")
+
+
+def _report_missed_cycles(matches: list[tuple[Run, EventMatch]]) -> None:
+    """Are the cycles the detector misses the cheap ones?
+
+    A miss on a shallow suck costs far less volume than a miss on a deep one, so the
+    count error and the volume error are not the same number.
+    """
+    pooled = []
+    for run, match in matches:
+        found = np.zeros(run.ref_t_ms.size, dtype=bool)
+        if match.pairs.size:
+            found[match.pairs[:, 1]] = True
+        if (~found).any() and np.isfinite(run.ref_depth_psi).all():
+            ranks = pd.Series(run.ref_depth_psi).rank(pct=True).to_numpy()
+            pooled.append(ranks[~found])
+    if not pooled:
+        return
+
+    depths = np.concatenate(pooled)
+    print(f"\n=== the {depths.size} missed cycles, by suction depth within their run ===")
+    print(f"  median depth percentile {100 * np.median(depths):.0f}; "
+          f"{100 * (depths < 0.25).mean():.0f}% in the shallowest quartile, "
+          f"{100 * (depths > 0.75).mean():.0f}% in the deepest")
 
 
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--root", default="new_dataset/Stage1_Sweeps_20260816/data")
+    parser.add_argument("--out", type=Path, default=Path("reports/strain_events_scores.csv"))
     args = parser.parse_args()
     root = Path(args.root)
+    config = DetectorConfig()
 
-    rows = []
-    missed_depth: list[np.ndarray] = []
+    runs: list[Run] = []
     for stem in discover_stems(root):
-        capture = open_capture(root, stem)
-        reference_frame = _reference_events(root, stem)
-        reference = reference_frame["t_ms"].to_numpy(np.float64)
-        if reference.size < 20:
-            continue
-        t_ms, block = _strain_block(root, stem, capture)
-
-        # score on the window the reference covers, so strain is not penalised for cycles
-        # during the fill transient and drain tail where no reference events exist
-        window = (t_ms >= reference.min()) & (t_ms <= reference.max())
-        if window.sum() < 500:
-            log.warning("%s: only %d strain samples in the reference window", stem,
-                        int(window.sum()))
-            continue
-
-        tolerance = tolerance_from_period(reference)
         try:
-            candidates = strain_event_candidates(t_ms[window], block[window],
-                                                 DetectorConfig())
-        except ValueError as exc:
+            run = _load(root, stem)
+        except (FileNotFoundError, KeyError, ValueError) as exc:
             log.warning("%s: %s", stem, exc)
             continue
+        if run is not None:
+            runs.append(run)
 
-        scored = []
-        for rank, result in enumerate(candidates):
-            pred = result.events["t_ms"].to_numpy(np.float64)
-            scored.append((match_events(pred, reference, tolerance), result, rank))
-        best = max(scored, key=lambda s: s[0].f1)
-        match, result, rank = best
-
-        # what a home session would actually get: no reference to score against, so the
-        # sign has to come from period steadiness alone
-        deployable, deployable_result, _ = scored[0]
-
-        # are the cycles strain misses the weak ones? a miss on a shallow suck costs far
-        # less volume than a miss on a deep one, so the count error and the volume error
-        # are not the same number
-        depth = reference_frame["depth_psi"].to_numpy(np.float64)
-        found_true = np.zeros(reference.size, dtype=bool)
-        if match.pairs.size:
-            found_true[match.pairs[:, 1]] = True
-        if (~found_true).any() and np.isfinite(depth).all():
-            ranks = pd.Series(depth).rank(pct=True).to_numpy()
-            missed_depth.append(ranks[~found_true])
-
-        rows.append({
-            "f1_deployable": deployable.f1,
-            "mad_ms_deployable": deployable.mad_ms,
-            "count_err_pct_deployable": deployable.count_error_pct,
-            "rate_pred_deployable": deployable_result.cycle_rate_cpm,
-            "stem": stem,
-            "level": capture.vacuum_level,
-            "cpm": capture.cycle_rate_cpm,
-            "n_true": match.n_true,
-            "f1": match.f1,
-            "precision": match.precision,
-            "recall": match.recall,
-            "count_err_pct": match.count_error_pct,
-            "bias_ms": match.bias_ms,
-            "mad_ms": match.mad_ms,
-            "tol_ms": tolerance,
-            "rate_true": rate_cpm(reference),
-            "rate_pred": result.cycle_rate_cpm,
-            "polarity_was_steadiest": rank == 0,
-            "period_cv": result.cycle_rate_cv,
-        })
-        print(f"  {stem[:34]:36} F1={match.f1:.3f} count={match.count_error_pct:+6.1f}% "
-              f"MAD={match.mad_ms:6.1f}ms", file=sys.stderr)
-
-    table = pd.DataFrame(rows)
-    if table.empty:
+    if not runs:
         print("no runs scored")
         return 1
+    log.info("scoring %d captures x %d channels x 2 signs", len(runs), len(STRAIN_CHANNELS))
 
-    print(f"\n{len(table)} runs scored, tolerance = quarter period "
-          f"({table['tol_ms'].min():.0f}-{table['tol_ms'].max():.0f} ms)\n")
+    scores = [s for run in runs for i in range(len(STRAIN_CHANNELS)) for sign in SIGNS
+              if (s := _score_channel(run, i, sign, config)) is not None]
+    df = _table(scores)
 
-    print("=== overall, against the pressure detector ===")
-    for col, label, unit in (("f1", "F1", ""), ("precision", "precision", ""),
-                             ("recall", "recall", ""), ("mad_ms", "timing MAD", " ms")):
-        v = table[col]
-        print(f"  {label:12} median {v.median():6.3f}{unit}   "
-              f"worst {v.min() if col != 'mad_ms' else v.max():6.3f}{unit}")
+    pd.set_option("display.width", 220, "display.max_columns", 40)
+    fmt = lambda v: f"{v:8.3f}"  # noqa: E731
 
-    abs_count = table["count_err_pct"].abs()
-    print(f"\n  cycle-count error, which is what volume integration inherits:")
-    print(f"    median |{abs_count.median():.1f}%|   90th pct {abs_count.quantile(0.9):.1f}%"
-          f"   worst {abs_count.max():.1f}%")
-    print(f"    runs within +-2%: {100 * (abs_count <= 2).mean():.0f}%   "
-          f"within +-5%: {100 * (abs_count <= 5).mean():.0f}%")
+    tolerances = [tolerance_from_period(r.ref_t_ms) for r in runs]
+    print(f"\n{len(runs)} runs scored, tolerance = quarter period "
+          f"({min(tolerances):.0f}-{max(tolerances):.0f} ms)")
 
-    signed = table["count_err_pct"]
-    print(f"    signed: mean {signed.mean():+.1f}%   median {signed.median():+.1f}%   "
+    print("\n=== every channel x sign, median over runs ===")
+    ranked = _summarise(df, ["channel", "sign"])
+    print(ranked.to_string(float_format=fmt))
+
+    _report_polarity(df)
+
+    channel, sign = ranked.index[0]
+    print(f"\n=== best single channel: {channel}, sign {sign:+.0f}, by vacuum level ===")
+    single = df[(df["channel"] == channel) & (df["sign"] == sign)]
+    print(_summarise(single, ["level"]).sort_index().to_string(float_format=fmt))
+
+    # the shippable detector: no named channel, no polarity left to guess
+    scored = [(run, out) for run in runs
+              if (out := _score_consensus(run, STRAIN_CHANNELS, CONSENSUS, config))]
+    consensus = _table([out[0] for _, out in scored])
+
+    print("\n=== consensus of the healthy channels, by vacuum level ===")
+    print(_summarise(consensus, ["level"]).sort_index().to_string(float_format=fmt))
+
+    print("\n=== best single channel vs consensus, over all runs ===")
+    print(_summarise(pd.concat([single.assign(channel=f"{channel} alone"), consensus]),
+                     ["channel"]).to_string(float_format=fmt))
+
+    # what a field failure of one channel costs, which is the question the overmold
+    # reliability problem actually poses
+    print("\n=== consensus with one channel removed (field-failure robustness) ===")
+    dropped: list[Score] = []
+    for name in STRAIN_CHANNELS:
+        rest = [c for c in STRAIN_CHANNELS if c != name]
+        dropped += [out[0] for run in runs
+                    if (out := _score_consensus(run, rest, f"-{name}", config))]
+    if dropped:
+        print(_summarise(_table(dropped), ["channel"]).to_string(float_format=fmt))
+
+    signed = consensus["count_err_pct"]
+    print(f"\n=== cycle count, which is what volume integration inherits ===")
+    print(f"  signed: mean {signed.mean():+.2f}%   median {signed.median():+.2f}%   "
           f"{100 * (signed < 0).mean():.0f}% of runs undercount")
-    print("    (a one-sided miscount is a bias, not noise: it will not average out over a "
-          "day the way a symmetric error would)")
+    print("  (a one-sided miscount is a bias, not noise: it will not average out over a "
+          "day\n   the way a symmetric error would)")
+    print(f"  precision {consensus['precision'].median():.3f} against recall "
+          f"{consensus['recall'].median():.3f} at the median, so the detector misses "
+          f"cycles\n   rather than inventing them")
 
-    if missed_depth:
-        pooled = np.concatenate(missed_depth)
-        print(f"\n  the {pooled.size} missed cycles sit at depth percentile "
-              f"{100 * np.median(pooled):.0f} (median) within their own run;")
-        print(f"    {100 * (pooled < 0.25).mean():.0f}% of them are in the shallowest "
-              f"quartile, {100 * (pooled > 0.75).mean():.0f}% in the deepest")
-        print("    (a miss on a shallow suck costs little volume, so the count bias and "
-              "the volume bias are not the same number)")
+    _report_missed_cycles([(run, out[1]) for run, out in scored])
 
-    rate_err = 100 * (table["rate_pred"] - table["rate_true"]).abs() / table["rate_true"]
-    print(f"\n  cycle-rate error: median {rate_err.median():.2f}%   worst {rate_err.max():.2f}%")
+    rel = 100.0 * (consensus["pred_rate_cpm"] - consensus["ref_rate_cpm"]) / consensus["ref_rate_cpm"]
+    print("\n=== cycle rate of the consensus (what a rate readout shows) ===")
+    print(f"  median {rel.median():+.2f}%   90th pct |err| "
+          f"{np.percentile(np.abs(rel), 90):.2f}%   worst {np.abs(rel).max():.2f}%")
 
-    print(f"\n=== the polarity problem: oracle vs what a home session gets ===")
-    print(f"  the steadier-period hypothesis was also the better-matching one on "
-          f"{100 * table['polarity_was_steadiest'].mean():.0f}% of runs\n")
-    print("  metric                 oracle (best sign)   deployable (steadiest sign)")
-    for col, label, fmt in (("f1", "F1 median", "{:.3f}"),
-                            ("mad_ms", "timing MAD median", "{:.1f} ms"),
-                            ("count_err_pct", "|count err| median", "{:.1f}%")):
-        a = table[col].abs().median() if col == "count_err_pct" else table[col].median()
-        b_col = table[f"{col}_deployable"]
-        b = b_col.abs().median() if col == "count_err_pct" else b_col.median()
-        print(f"  {label:22} {fmt.format(a):>18}   {fmt.format(b):>27}")
-    rate_dep = (100 * (table["rate_pred_deployable"] - table["rate_true"]).abs()
-                / table["rate_true"])
-    print(f"  {'rate err median':22} {rate_err.median():17.2f}%   {rate_dep.median():26.2f}%")
-    print("\n  counts and rates are polarity-independent and transfer as-is. Per-event")
-    print("  timing does not, until the sign of each channel is settled on the bench.")
+    print("\n=== weakest five runs, consensus ===")
+    print(consensus.nsmallest(5, "f1")[
+        ["stem", "level", "f1", "count_err_pct", "bias_ms", "mad_ms"]
+    ].to_string(index=False, float_format=lambda v: f"{v:8.2f}"))
 
-    print("\n=== by vacuum level ===")
-    print("  level  n   median F1   median |count err|   median MAD")
-    for level, group in table.groupby("level"):
-        print(f"  L{level}     {len(group):2d}   {group['f1'].median():9.3f}   "
-              f"{group['count_err_pct'].abs().median():17.1f}%   "
-              f"{group['mad_ms'].median():8.1f} ms")
-
-    worst = table.nsmallest(5, "f1")[["stem", "level", "f1", "count_err_pct", "mad_ms"]]
-    print("\n=== weakest five runs ===")
-    print(worst.to_string(index=False))
+    args.out.parent.mkdir(parents=True, exist_ok=True)
+    pd.concat([df, consensus]).to_csv(args.out, index=False)
+    print(f"\nwrote {args.out}")
     return 0
 
 

@@ -13,8 +13,8 @@ import pytest
 
 from milkeaze.config import SensorConfig
 from milkeaze.data.rig_session import (
-    POOLED, SENSOR_BOARD, STRICT, discover_stems, load_pressure, load_rig_session,
-    load_temperature, open_capture, pooled_skew_ppm,
+    POOLED, SENSOR_BOARD, STRICT, discover_stems, fill_dropped_strain, load_pressure,
+    load_rig_session, load_temperature, open_capture, pooled_skew_ppm,
 )
 from milkeaze.data.schema import validate_sidecars
 
@@ -296,3 +296,29 @@ def test_schema_report_errors_on_a_missing_conversion(tmp_path):
     report = validate_sidecars(open_capture(tmp_path, "cap"))
     assert not report.ok
     assert any("pressure" in issue.field for issue in report.errors)
+
+
+def test_dropped_strain_samples_are_interpolated_not_left_as_zeros():
+    """A zero is a dropped sample in this format; a zero-phase filter cannot see a NaN."""
+    ramp = np.arange(1.0, 21.0)
+    block = np.column_stack([ramp.copy(), ramp.copy()])
+    block[5, 0] = 0.0
+    block[10:13, 1] = 0.0
+
+    filled = fill_dropped_strain(block)
+    assert not (filled == 0.0).any()
+    assert np.isfinite(filled).all()
+    assert filled[:, 0] == pytest.approx(ramp)
+    assert filled[:, 1] == pytest.approx(ramp)
+
+
+def test_a_strain_channel_with_no_real_samples_stays_flat():
+    """Flat is what the in-band power check downstream needs, not an invented cycle."""
+    block = np.column_stack([np.arange(1.0, 11.0), np.zeros(10)])
+    filled = fill_dropped_strain(block)
+    assert (filled[:, 1] == 0.0).all()
+
+
+def test_fill_dropped_strain_rejects_a_single_channel_vector():
+    with pytest.raises(ValueError, match="n_time, n_channels"):
+        fill_dropped_strain(np.arange(10.0))
