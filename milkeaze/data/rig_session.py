@@ -54,6 +54,20 @@ RIG_BOARD = "rig"
 RESOLVED = "resolved"
 _MAD_TO_SIGMA = 1.4826
 
+#: Device timestamps are 32-bit microsecond counters, so they roll over every
+#: ``2**32 us`` = 4294.967 s (71.6 min) of board uptime. A run that straddles a boundary
+#: has a single backward jump of most of that span. Left alone it does not degrade a
+#: clock fit, it destroys it: on the one capture in the 20260816 batch where the rig
+#: board wrapped, an unwrapped least-squares fit returns a slope of -0.045 instead of
+#: 1.000, i.e. rig time running backwards at 45x. Steve's capture tool unwraps before
+#: writing its sidecar estimate, which is why the sidecar reports a clean 0.36 ms jitter
+#: for that capture and nothing upstream looks wrong.
+_WRAP_US = 2 ** 32
+
+#: Only a jump larger than half the counter range is read as a rollover; smaller
+#: backward steps are ordinary out-of-order packets and belong to ``repair_monotonic``.
+_WRAP_THRESHOLD_US = _WRAP_US / 2
+
 #: what to do when a capture's own skew estimate did not resolve
 POOLED = "pooled"    # substitute the dataset-level estimate (default)
 SESSION = "session"  # use the unresolved per-session value anyway
@@ -71,6 +85,21 @@ _IMU_COLUMNS = {
 }
 
 
+def unwrap_device_us(raw: np.ndarray) -> tuple[np.ndarray, int]:
+    """Undo 32-bit rollover in a device microsecond counter.
+
+    Returns the monotonic series and the number of rollovers found.
+    """
+    values = np.asarray(raw, dtype=np.float64)
+    if values.size < 2:
+        return values, 0
+    rollovers = np.diff(values) < -_WRAP_THRESHOLD_US
+    if not rollovers.any():
+        return values, 0
+    counts = np.concatenate(([0.0], np.cumsum(rollovers.astype(np.float64))))
+    return values + counts * _WRAP_US, int(rollovers.sum())
+
+
 @dataclass
 class BoardClock:
     """Maps a board's device timestamps onto host monotonic seconds."""
@@ -86,13 +115,32 @@ class BoardClock:
     #: RMS of (host - predicted host) over the sync points, in ms
     residual_ms: float = 0.0
 
+    #: rollovers seen in this board's sync file; >0 means the run straddled a boundary
+    wraps: int = 0
+
+    #: unwrapped device-time range covered by the sync file, in us. Streams are shifted
+    #: by whole counter periods onto this range, so a stream that begins after a rollover
+    #: is not read as belonging to the previous epoch.
+    device_lo_us: float = 0.0
+    device_hi_us: float = 0.0
+
     @property
     def slope(self) -> float:
         """``host_s = slope * device_s + offset_s``."""
         return 1.0 + self.skew_ppm * 1e-6
 
+    def align_device_us(self, device_ts_us: np.ndarray) -> np.ndarray:
+        """Unwrap a stream and put it in the same counter epoch as the sync file."""
+        values, _ = unwrap_device_us(device_ts_us)
+        if values.size == 0 or self.device_hi_us <= self.device_lo_us:
+            return values
+        centre = 0.5 * (self.device_lo_us + self.device_hi_us)
+        shift = round((centre - float(np.median(values))) / _WRAP_US)
+        return values + shift * _WRAP_US
+
     def to_host_s(self, device_ts_us: np.ndarray) -> np.ndarray:
-        return self.slope * (np.asarray(device_ts_us, dtype=np.float64) / 1e6) + self.offset_s
+        aligned = self.align_device_us(device_ts_us)
+        return self.slope * (aligned / 1e6) + self.offset_s
 
 
 @dataclass
@@ -207,7 +255,14 @@ def _board_clock(root: Path, stem: str, board: str, alignment: dict[str, Any],
                         stem, board, confidence)
 
     host_s = sync["host_mono_s"].to_numpy(dtype=np.float64)
-    device_s = sync["device_ts_us"].to_numpy(dtype=np.float64) / 1e6
+    device_us, wraps = unwrap_device_us(sync["device_ts_us"].to_numpy(dtype=np.float64))
+    if wraps:
+        log.warning(
+            "%s: board '%s' device counter rolled over %d time(s) mid-run; unwrapping "
+            "before the clock fit (an unwrapped fit here returns a negative slope)",
+            stem, board, wraps,
+        )
+    device_s = device_us / 1e6
 
     # host_s = (1 + skew_ppm*1e-6) * device_s + offset. The slope is given; only the
     # offset is solved here, and by median so Wi-Fi outliers cannot drag it.
@@ -227,6 +282,9 @@ def _board_clock(root: Path, stem: str, board: str, alignment: dict[str, Any],
         confidence=confidence,
         skew_source=source,
         residual_ms=float(np.sqrt(np.mean(residual_ms ** 2))),
+        wraps=wraps,
+        device_lo_us=float(device_us.min()),
+        device_hi_us=float(device_us.max()),
     )
 
 

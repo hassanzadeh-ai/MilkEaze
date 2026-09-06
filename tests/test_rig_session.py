@@ -14,7 +14,7 @@ import pytest
 from milkeaze.config import SensorConfig
 from milkeaze.data.rig_session import (
     POOLED, SENSOR_BOARD, STRICT, discover_stems, load_pressure, load_rig_session,
-    open_capture, pooled_skew_ppm,
+    load_temperature, open_capture, pooled_skew_ppm,
 )
 from milkeaze.data.schema import validate_sidecars
 
@@ -50,8 +50,10 @@ def write_capture(root, stem, duration_s=60.0, sensor_skew_ppm=25.0, rig_skew_pp
     root.mkdir(parents=True, exist_ok=True)
 
     def device_us(host_s, skew_ppm, dev0):
-        # invert the documented relation to place a host instant on the device clock
-        return ((host_s - host_t0) / (1.0 + skew_ppm * 1e-6) + dev0) * 1e6
+        # invert the documented relation to place a host instant on the device clock,
+        # then wrap it the way a 32-bit microsecond counter does on the hardware
+        exact = ((host_s - host_t0) / (1.0 + skew_ppm * 1e-6) + dev0) * 1e6
+        return exact % (2 ** 32)
 
     for board, skew in ((SENSOR_BOARD, sensor_skew_ppm), ("rig", rig_skew_ppm)):
         host = host_t0 + np.arange(0.0, duration_s, 1.0)
@@ -229,12 +231,56 @@ def test_pressure_converts_with_suction_negative(tmp_path):
     assert psi.mean() == pytest.approx(-0.5, abs=0.2)
 
 
+#: places a 60 s run so that the counter rolls over 30 s in
+_WRAP_S = 2 ** 32 / 1e6
+_STRADDLES_THE_BOUNDARY = _WRAP_S - 30.0
+
+
+def test_a_counter_rollover_mid_run_does_not_break_the_clock(tmp_path):
+    """A run straddling the 71.6-minute boundary must still align.
+
+    Without unwrapping, the fit does not degrade gracefully: it returns a slope near
+    -0.045, i.e. device time running backwards at 45x, and every cross-board window in
+    the capture lands somewhere arbitrary. This happened for real on the rig board of
+    sweep_v2_c46_r1 in the 20260816 batch.
+    """
+    write_capture(tmp_path, "cap", duration_s=60.0, device_t0_s=_STRADDLES_THE_BOUNDARY)
+    capture = open_capture(tmp_path, "cap")
+
+    for board in ("sensor", "rig"):
+        clock = capture.clocks[board]
+        assert clock.wraps == 1, f"{board}: rollover not detected"
+        assert clock.residual_ms < 1.0, f"{board}: residual {clock.residual_ms:.1f} ms"
+        assert clock.slope == pytest.approx(1.0, abs=1e-4)
+
+    t_ms, _ = load_pressure(capture)
+    assert np.all(np.diff(t_ms) > 0)
+    assert t_ms.max() - t_ms.min() == pytest.approx(60_000.0, rel=0.01)
+
+
+def test_streams_are_placed_in_the_same_counter_epoch_as_the_sync_file(tmp_path):
+    """A stream whose samples all sit past the rollover must not be read an epoch early."""
+    write_capture(tmp_path, "cap", duration_s=60.0, device_t0_s=_STRADDLES_THE_BOUNDARY)
+    capture = open_capture(tmp_path, "cap")
+
+    # the temperature stream is sparse enough that its own samples may show no rollover,
+    # so its epoch has to come from the clock rather than from the stream itself
+    t_ms, degc = load_temperature(capture)
+    assert degc.size > 0
+    assert t_ms.min() > -1_000.0
+    assert t_ms.max() < 120_000.0, f"temperature landed at {t_ms.max():.0f} ms, an epoch out"
+
+    strain_t, _ = load_pressure(capture)
+    assert abs(float(np.median(t_ms)) - float(np.median(strain_t))) < 5_000.0
+
+
 def test_schema_report_flags_the_known_gaps(tmp_path):
     write_capture(tmp_path, "cap")
     report = validate_sidecars(open_capture(tmp_path, "cap"))
     flagged = {issue.field for issue in report.issues}
-    assert "schema_version" in flagged
-    assert "run.fill_state" in flagged
+    assert "schema" in flagged
+    assert "fill" in flagged
+    assert "run.outlet" in flagged
     assert "run.orientation" in flagged          # boards disagree by construction
     assert "device.strain_ch_mask" in flagged
     assert report.ok                              # all warnings, nothing unusable
