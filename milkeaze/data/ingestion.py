@@ -30,6 +30,10 @@ log = get_logger(__name__)
 class SessionLayout(str, Enum):
     FLAT = "flat"   # dev contract: strain.csv / imu.csv / mic.csv / scale.csv + meta.json
     RIG = "rig"     # production dual-board capture: <stem>_sensor_*.csv + <stem>_rig_*.csv
+    # a home session: the same sensor board, but no rig board beside it, so no vacuum
+    # line, no pressure channel and usually no scale. Same file naming as RIG, which is
+    # why it is detected by which boards are present rather than by a different reader.
+    LIVE = "live"
 
 
 @dataclass

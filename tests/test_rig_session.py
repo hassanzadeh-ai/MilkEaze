@@ -12,16 +12,23 @@ import pandas as pd
 import pytest
 
 from milkeaze.config import SensorConfig
+from milkeaze.data.ingestion import SessionLayout
 from milkeaze.data.rig_session import (
-    POOLED, SENSOR_BOARD, STRICT, discover_stems, fill_dropped_strain, load_pressure,
-    load_rig_session, load_temperature, open_capture, pooled_skew_ppm,
+    POOLED, SENSOR_BOARD, STRICT, MissingRigBoard, discover_stems, fill_dropped_strain,
+    load_pressure, load_rig_session, load_temperature, open_capture, pooled_skew_ppm,
 )
-from milkeaze.data.schema import validate_sidecars
+from milkeaze.data.schema import ERROR, validate_sidecars
+from milkeaze.eval.baselines import strain_consensus_events
 
 STRAIN_COLS = ["ch0_Radial_N", "ch1_Radial_E", "ch2_Radial_S", "ch3_Radial_W",
                "ch4_Arc_Inner_E", "ch5_Arc_Outer_E", "ch6_Arc_Inner_W", "ch7_Arc_Outer_W"]
 
 P_OUT_MIN, P_OUT_MAX, P_MIN, P_MAX = 1677722.0, 15099494.0, -15.0, 15.0
+
+#: Which way each fabricated channel deflects under suction: +1 with the majority, -1
+#: inverted like Radial_2, 0 for a tap that carries no cycle at all like Arc_2_out.
+STRAIN_CYCLE_POLARITY = {col: (0 if i == 7 else -1 if i == 6 else +1)
+                         for i, col in enumerate(STRAIN_COLS)}
 
 
 def _psi_to_raw(psi):
@@ -42,7 +49,7 @@ def _conversion():
 
 def write_capture(root, stem, duration_s=60.0, sensor_skew_ppm=25.0, rig_skew_ppm=-35.0,
                   sensor_confidence="resolved", sensor_se_ppm=2.0, cpm=42.0,
-                  host_t0=1000.0, device_t0_s=500.0):
+                  host_t0=1000.0, device_t0_s=500.0, strain_cycles=False):
     """Fabricate a dual-board capture whose true clock relationship is known.
 
     Device time advances such that ``host = (1 + skew*1e-6) * device + offset``.
@@ -65,8 +72,19 @@ def write_capture(root, stem, duration_s=60.0, sensor_skew_ppm=25.0, rig_skew_pp
     n_strain = int(duration_s * 80)
     host = host_t0 + np.linspace(0, duration_s, n_strain, endpoint=False)
     strain = pd.DataFrame({"scan_t_us": device_us(host, sensor_skew_ppm, device_t0_s)})
-    for i, col in enumerate(STRAIN_COLS):
-        strain[col] = np.linspace(0, 1000, n_strain) + i
+    if strain_cycles:
+        # A ring that actually breathes, so a detector has something to find. Suction is
+        # deepest where the fabricated pressure bottoms out, at t = k/f, and the channel
+        # signs mirror what the batch measured: mostly agreeing, one inverted, one dead.
+        cycle = np.cos(2 * np.pi * (cpm / 60.0) * (host - host_t0))
+        for i, col in enumerate(STRAIN_COLS):
+            sign = STRAIN_CYCLE_POLARITY[col]
+            # a large DC offset keeps every sample away from the exact zero that means
+            # "dropped sample" downstream
+            strain[col] = 10000.0 + (500.0 * sign * cycle if sign else 0.0)
+    else:
+        for i, col in enumerate(STRAIN_COLS):
+            strain[col] = np.linspace(0, 1000, n_strain) + i
     strain.to_csv(root / f"{stem}_sensor_strain.csv", index=False)
 
     n_imu = int(duration_s * 416)
@@ -138,6 +156,117 @@ def write_capture(root, stem, duration_s=60.0, sensor_skew_ppm=25.0, rig_skew_pp
         "files": {"pressure": f"{stem}_rig_pressure.csv"},
     }), encoding="utf-8")
     return stem
+
+
+def write_live_capture(root, stem, with_scale=False, **kwargs):
+    """Fabricate a home session: the same sensor board, with no rig board beside it.
+
+    Written by subtraction from :func:`write_capture` on purpose. The field capture runs
+    the same firmware and the same filenames; what is missing is the bench hardware, and
+    building the fixture that way keeps the two layouts from drifting apart here.
+    """
+    write_capture(root, stem, **kwargs)
+
+    for name in (f"{stem}_rig_sync.csv", f"{stem}_rig_pressure.csv",
+                 f"{stem}_rig_temp.csv", f"{stem}_rig.json"):
+        (root / name).unlink()
+    if not with_scale:
+        (root / f"{stem}_sensor_scale.csv").unlink()
+
+    session_path = root / f"{stem}_session.json"
+    session = json.loads(session_path.read_text(encoding="utf-8"))
+    session["boards"].pop("rig")
+    session["alignment"].pop("rig")
+    session_path.write_text(json.dumps(session), encoding="utf-8")
+
+    sensor_path = root / f"{stem}_sensor.json"
+    sensor = json.loads(sensor_path.read_text(encoding="utf-8"))
+    # no pump, so no commanded vacuum or rate; the infant sets both
+    for key in ("vacuum_level", "cycle_rate_cpm"):
+        sensor["run"].pop(key, None)
+    sensor_path.write_text(json.dumps(sensor), encoding="utf-8")
+    return stem
+
+
+def test_live_capture_loads_without_a_rig_board(tmp_path):
+    write_live_capture(tmp_path, "home")
+    capture = open_capture(tmp_path, "home")
+
+    assert not capture.has_rig_board
+    assert capture.boards == [SENSOR_BOARD]
+    assert capture.layout is SessionLayout.LIVE
+
+    raw = load_rig_session(tmp_path, SensorConfig.load(), stem="home")
+    assert raw.layout is SessionLayout.LIVE
+    assert raw.meta["layout"] == "live"
+    assert not raw.has_scale
+    assert raw.strain.shape[1] == len(STRAIN_COLS)
+    assert raw.imu.size and raw.mic.size
+
+
+def test_live_capture_keeps_the_sensor_timebase_it_would_have_had(tmp_path):
+    """Dropping the rig board must not move the sensor stream on the session clock.
+
+    The origin is the earliest sync point across the boards present, so a reader that
+    handled one board by accident rather than by design could silently re-zero the
+    timeline the moment the rig board went away.
+    """
+    write_capture(tmp_path / "bench", "cap")
+    write_live_capture(tmp_path / "home", "cap")
+
+    bench = load_rig_session(tmp_path / "bench", SensorConfig.load(), stem="cap")
+    home = load_rig_session(tmp_path / "home", SensorConfig.load(), stem="cap")
+
+    assert np.allclose(bench.strain_t_ms, home.strain_t_ms, atol=1e-6)
+    assert np.allclose(bench.imu_t_ms, home.imu_t_ms, atol=1e-6)
+
+
+def test_rig_only_streams_say_why_they_are_absent(tmp_path):
+    write_live_capture(tmp_path, "home")
+    capture = open_capture(tmp_path, "home")
+
+    for loader in (load_pressure, load_temperature):
+        with pytest.raises(MissingRigBoard, match="no rig board"):
+            loader(capture)
+
+
+def test_live_capture_yields_sucks_from_strain_alone(tmp_path):
+    """The whole point of the layout: a home session reaching events with no vacuum line."""
+    duration_s, cpm = 120.0, 42.0
+    write_live_capture(tmp_path, "home", duration_s=duration_s, cpm=cpm,
+                       strain_cycles=True)
+    raw = load_rig_session(tmp_path, SensorConfig.load(), stem="home")
+
+    result = strain_consensus_events(raw.strain_t_ms, raw.strain, list(STRAIN_COLS),
+                                     polarity=STRAIN_CYCLE_POLARITY)
+
+    expected = duration_s * cpm / 60.0
+    assert abs(result.n_events - expected) <= 1
+    assert result.cycle_rate_cpm == pytest.approx(cpm, abs=1.0)
+
+    # suction bottoms out once per cycle starting at t=0, and the detector should land
+    # on those troughs rather than somewhere in the rising flank
+    period_ms = 60_000.0 / cpm
+    phase_ms = result.events["t_ms"].to_numpy() % period_ms
+    offset = np.median(np.minimum(phase_ms, period_ms - phase_ms))
+    assert offset < 0.1 * period_ms
+
+
+def test_validator_does_not_fault_a_live_capture_for_missing_bench_hardware(tmp_path):
+    write_live_capture(tmp_path, "home")
+    report = validate_sidecars(open_capture(tmp_path, "home"))
+
+    rig_fields = ("alignment.rig", "conversion.rig.pressure", "run.vacuum_level",
+                  "run.outlet", "fill", "scale")
+    assert not [i for i in report.issues
+                if i.level == ERROR and i.field.startswith(rig_fields)]
+
+
+def test_validator_flags_a_live_capture_with_no_ground_truth(tmp_path):
+    write_live_capture(tmp_path, "home")
+    fields = {i.field for i in validate_sidecars(open_capture(tmp_path, "home")).issues}
+    assert "run.weight_before_g" in fields
+    assert "run.subject" in fields
 
 
 def test_clock_maps_device_time_onto_host_time(tmp_path):

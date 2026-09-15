@@ -51,6 +51,16 @@ log = get_logger(__name__)
 SENSOR_BOARD = "sensor"
 RIG_BOARD = "rig"
 
+
+class MissingRigBoard(FileNotFoundError):
+    """Raised when a rig-only stream is asked of a home session.
+
+    Subclasses ``FileNotFoundError`` so existing callers that already skip missing
+    streams keep working, while callers that want to distinguish "this session never
+    had a vacuum line" from "this capture is incomplete" can catch it specifically.
+    """
+
+
 RESOLVED = "resolved"
 _MAD_TO_SIGMA = 1.4826
 
@@ -145,7 +155,13 @@ class BoardClock:
 
 @dataclass
 class RigCapture:
-    """A production capture, including the rig streams the model does not consume."""
+    """A production capture, including the rig streams the model does not consume.
+
+    Also covers a home session, which is the same sensor board with no rig board
+    beside it. :attr:`clocks` then holds one entry instead of two, :attr:`rig_meta` is
+    empty, and there is no pressure channel and usually no scale. Callers that need
+    rig-only data should check :attr:`has_rig_board` rather than assume both boards.
+    """
 
     stem: str
     root: Path
@@ -156,6 +172,19 @@ class RigCapture:
     t0_host_s: float
     #: per-stream timestamp repair stats, filled in as streams are read
     repairs: dict[str, dict[str, Any]] = field(default_factory=dict)
+
+    @property
+    def boards(self) -> list[str]:
+        """The boards this capture actually carries, sensor first."""
+        return [b for b in (SENSOR_BOARD, RIG_BOARD) if b in self.clocks]
+
+    @property
+    def has_rig_board(self) -> bool:
+        return RIG_BOARD in self.clocks
+
+    @property
+    def layout(self) -> SessionLayout:
+        return SessionLayout.RIG if self.has_rig_board else SessionLayout.LIVE
 
     @property
     def vacuum_level(self) -> int | None:
@@ -334,17 +363,32 @@ def open_capture(root: str | Path, stem: str | None = None,
 
     session_meta = _read_json(root / f"{stem}_session.json")
     sensor_meta = _read_json(root / f"{stem}_sensor.json")
-    rig_meta = _read_json(root / f"{stem}_rig.json")
+
+    # A home session carries the sensor board alone, so the rig sidecar and the rig
+    # clock are absent rather than malformed. Presence is decided by the sync file,
+    # which is the one file a board cannot be aligned without.
+    boards = [b for b in (SENSOR_BOARD, RIG_BOARD)
+              if (root / f"{stem}_{b}_sync.csv").exists()]
+    if SENSOR_BOARD not in boards:
+        raise FileNotFoundError(
+            f"missing clock sync file: {root / f'{stem}_{SENSOR_BOARD}_sync.csv'}"
+        )
+
+    rig_path = root / f"{stem}_rig.json"
+    rig_meta = _read_json(rig_path) if RIG_BOARD in boards else {}
+    if RIG_BOARD not in boards:
+        log.info("capture %s: no rig board, reading as a %s session",
+                 stem, SessionLayout.LIVE.value)
 
     alignment = session_meta.get("alignment", {})
     clocks = {
         board: _board_clock(root, stem, board, alignment, skew_fallback)
-        for board in (SENSOR_BOARD, RIG_BOARD)
+        for board in boards
     }
 
-    # a common origin so both boards land on one zero-based millisecond timebase
+    # a common origin so every board lands on one zero-based millisecond timebase
     first_host = []
-    for board in (SENSOR_BOARD, RIG_BOARD):
+    for board in boards:
         sync = pd.read_csv(root / f"{stem}_{board}_sync.csv", usecols=["host_mono_s"])
         first_host.append(float(sync["host_mono_s"].iloc[0]))
 
@@ -440,12 +484,26 @@ def _load_mic(root: Path, stem: str, capture: RigCapture,
     return t_ms, mic
 
 
+def _require_rig_board(capture: RigCapture, stream: str) -> None:
+    """Fail a rig-only stream on a home session with the reason, not a KeyError.
+
+    Worth being explicit: the absence is the normal case for a live session, not a
+    corrupt capture, and the caller usually wants to skip rather than abort.
+    """
+    if not capture.has_rig_board:
+        raise MissingRigBoard(
+            f"capture {capture.stem} has no rig board, so there is no {stream} stream; "
+            f"this is a '{SessionLayout.LIVE.value}' session, check capture.has_rig_board"
+        )
+
+
 def load_pressure(capture: RigCapture) -> tuple[np.ndarray, np.ndarray]:
     """Vacuum-line pressure as ``(t_ms, psi)`` on the session timebase.
 
     Suction reads negative, per the sidecar sign convention. Conversion constants come
     from the rig sidecar rather than being hardcoded, since they are per-part.
     """
+    _require_rig_board(capture, "pressure")
     path = capture.root / f"{capture.stem}_rig_pressure.csv"
     if not path.exists():
         raise FileNotFoundError(f"missing rig pressure stream: {path}")
@@ -465,6 +523,7 @@ def load_pressure(capture: RigCapture) -> tuple[np.ndarray, np.ndarray]:
 
 def load_temperature(capture: RigCapture) -> tuple[np.ndarray, np.ndarray]:
     """Rig ambient temperature as ``(t_ms, degC)`` from the TMP117."""
+    _require_rig_board(capture, "temperature")
     path = capture.root / f"{capture.stem}_rig_temp.csv"
     if not path.exists():
         raise FileNotFoundError(f"missing rig temperature stream: {path}")
@@ -517,10 +576,11 @@ def load_rig_session(root: str | Path, sensors: SensorConfig | None = None,
 
     meta: dict[str, Any] = {
         "session_id": stem,
-        "layout": SessionLayout.RIG.value,
+        "layout": capture.layout.value,
         "session": capture.session_meta,
         "sensor": capture.sensor_meta,
         "rig": capture.rig_meta,
+        "boards": capture.boards,
         "clocks": {b: vars(c) for b, c in capture.clocks.items()},
         "timestamp_repairs": dict(capture.repairs),
         "vacuum_level": capture.vacuum_level,
@@ -528,9 +588,9 @@ def load_rig_session(root: str | Path, sensors: SensorConfig | None = None,
     }
 
     log.info(
-        "loaded rig capture %s: strain %.1f Hz, imu %.1f Hz, mic %.0f Hz, %d mic channel(s)",
-        stem, effective_rate_hz(strain_t_ms), effective_rate_hz(imu_t_ms),
-        effective_rate_hz(mic_t_ms), mic.shape[1],
+        "loaded %s capture %s: strain %.1f Hz, imu %.1f Hz, mic %.0f Hz, %d mic channel(s)",
+        capture.layout.value, stem, effective_rate_hz(strain_t_ms),
+        effective_rate_hz(imu_t_ms), effective_rate_hz(mic_t_ms), mic.shape[1],
     )
 
     return RawSession(
@@ -549,7 +609,7 @@ def load_rig_session(root: str | Path, sensors: SensorConfig | None = None,
             "imu": effective_rate_hz(imu_t_ms),
             "mic": effective_rate_hz(mic_t_ms),
         },
-        layout=SessionLayout.RIG,
+        layout=capture.layout,
         # the sensor board converts IMU on-device; strain and audio stay as counts
         units={"strain": COUNTS, "imu": PHYSICAL, "mic": COUNTS},
         meta=meta,

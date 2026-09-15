@@ -121,7 +121,7 @@ def _check_alignment(capture: RigCapture, report: SidecarReport) -> None:
         report.add(ERROR, "alignment", "absent; cross-board timestamps cannot be trusted")
         return
 
-    for board in (SENSOR_BOARD, RIG_BOARD):
+    for board in capture.boards:
         info = alignment.get(board)
         if not info:
             report.add(ERROR, f"alignment.{board}", "missing board alignment block")
@@ -182,29 +182,34 @@ def _check_alignment(capture: RigCapture, report: SidecarReport) -> None:
 def _check_run_block(capture: RigCapture, report: SidecarReport) -> None:
     run = capture.sensor_meta.get("run") or {}
 
-    if run.get("vacuum_level") is None:
-        report.add(ERROR, "run.vacuum_level", "absent; the capture's condition is unknown")
-    if run.get("cycle_rate_cpm") is None:
-        report.add(WARNING, "run.cycle_rate_cpm", "absent; falling back to detected rate")
+    # Vacuum level, commanded cycle rate and reservoir fill are settings of the bench
+    # pump. A home session has no pump: the infant sets the rate and the breast is not
+    # a reservoir with a level, so demanding these of a live capture would report a
+    # defect for every session the product is actually meant to run in.
+    if capture.has_rig_board:
+        if run.get("vacuum_level") is None:
+            report.add(ERROR, "run.vacuum_level", "absent; the capture's condition is unknown")
+        if run.get("cycle_rate_cpm") is None:
+            report.add(WARNING, "run.cycle_rate_cpm", "absent; falling back to detected rate")
 
-    # Schema 2 moved this to the session block; accept either spelling.
-    fill = capture.session_meta.get("fill", run.get("fill_state"))
-    if fill is None:
-        report.add(
-            WARNING, "fill",
-            "absent; vacuum and fill state are confounded without it "
-            "(required once the schema is frozen)",
-        )
+        # Schema 2 moved this to the session block; accept either spelling.
+        fill = capture.session_meta.get("fill", run.get("fill_state"))
+        if fill is None:
+            report.add(
+                WARNING, "fill",
+                "absent; vacuum and fill state are confounded without it "
+                "(required once the schema is frozen)",
+            )
 
-    # Once the outlet is actuated rather than passive it becomes an independent factor,
-    # and a batch that varies it without recording it is confounded the same way this
-    # one was confounded by fill.
-    if "outlet" not in run:
-        report.add(
-            WARNING, "run.outlet",
-            "absent; with a controllable outlet, vacuum no longer determines flow, so "
-            "the outlet setting has to be recorded to keep the two separable",
-        )
+        # Once the outlet is actuated rather than passive it becomes an independent
+        # factor, and a batch that varies it without recording it is confounded the
+        # same way this one was confounded by fill.
+        if "outlet" not in run:
+            report.add(
+                WARNING, "run.outlet",
+                "absent; with a controllable outlet, vacuum no longer determines flow, "
+                "so the outlet setting has to be recorded to keep the two separable",
+            )
 
     sensor_orientation = run.get("orientation")
     rig_orientation = (capture.rig_meta.get("run") or {}).get("orientation")
@@ -237,6 +242,14 @@ def _check_device_block(capture: RigCapture, report: SidecarReport) -> None:
 
 
 def _check_conversions(capture: RigCapture, report: SidecarReport) -> None:
+    if _get(capture.sensor_meta, "conversion.strain") is None:
+        report.add(ERROR, "conversion.strain", "absent; strain counts cannot be calibrated")
+
+    # A home session has no vacuum line, so a missing pressure conversion is the
+    # expected state rather than a defect. Events there come from the strain ring.
+    if not capture.has_rig_board:
+        return
+
     pressure = _get(capture.rig_meta, "conversion.rig.pressure")
     if not pressure:
         report.add(ERROR, "conversion.rig.pressure",
@@ -245,9 +258,6 @@ def _check_conversions(capture: RigCapture, report: SidecarReport) -> None:
     for key in ("out_min_counts", "out_max_counts", "p_min_psi", "p_max_psi"):
         if pressure.get(key) is None:
             report.add(ERROR, f"conversion.rig.pressure.{key}", "missing conversion constant")
-
-    if _get(capture.sensor_meta, "conversion.strain") is None:
-        report.add(ERROR, "conversion.strain", "absent; strain counts cannot be calibrated")
 
 
 def _check_streams(capture: RigCapture, report: SidecarReport) -> None:
@@ -352,7 +362,10 @@ def _check_scale(capture: RigCapture, report: SidecarReport) -> None:
     """The scale is the only ground truth for volume, so its faults are errors."""
     scale = capture.sensor_meta.get("scale")
     if not isinstance(scale, dict) or not scale:
-        report.add(WARNING, "scale", "absent; no volume ground truth for this capture")
+        # On a live session pre/post weights can stand in for the bench scale, so the
+        # ground-truth question is decided in _check_live_session instead.
+        if capture.has_rig_board:
+            report.add(WARNING, "scale", "absent; no volume ground truth for this capture")
         return
 
     if scale.get("error"):
@@ -370,6 +383,42 @@ def _check_scale(capture: RigCapture, report: SidecarReport) -> None:
         report.add(WARNING, "scale.ground_truth",
                    "not flagged as ground truth; volume targets from this capture are "
                    "not trustworthy")
+
+
+def _check_live_session(capture: RigCapture, report: SidecarReport) -> None:
+    """What a home session has to carry to be worth more than a suck count.
+
+    A live session brings no rig board, so it has neither a pressure channel nor a
+    bench scale. Detection, rate and comfort still work from the strain ring alone.
+    Volume does not: without either a continuous scale or a pre/post feed weight there
+    is no target to score a predicted total against, so the session can train nothing
+    and validate nothing about the number the product exists to report. That is a
+    property of how the session was captured, not a file that went missing, which is
+    why it is worth saying loudly at ingestion rather than discovering it in analysis.
+    """
+    if capture.has_rig_board:
+        return
+
+    run = capture.sensor_meta.get("run") or {}
+    has_weights = (run.get("weight_before_g") is not None
+                   and run.get("weight_after_g") is not None)
+    has_scale = (capture.root / f"{capture.stem}_sensor_scale.csv").exists()
+
+    if not (has_weights or has_scale):
+        report.add(
+            WARNING, "run.weight_before_g",
+            "live session with no scale stream and no pre/post feed weight, so it "
+            "carries no volume ground truth; usable for suck detection and rate, not "
+            "for validating or training a volume estimate",
+        )
+
+    if run.get("subject") is None:
+        report.add(
+            WARNING, "run.subject",
+            "absent; live sessions come from different mothers and infants, and "
+            "per-subject calibration and cross-subject generalisation both need to "
+            "know which is which",
+        )
 
 
 def _freeze(report: SidecarReport) -> SidecarReport:
@@ -409,8 +458,9 @@ def validate_sidecars(capture: RigCapture, frozen: bool = False) -> SidecarRepor
     _check_streams(capture, report)
     _check_events(capture, report, version)
     _check_scale(capture, report)
+    _check_live_session(capture, report)
 
-    for board in (SENSOR_BOARD, RIG_BOARD):
+    for board in capture.boards:
         files = (capture.sensor_meta if board == SENSOR_BOARD else capture.rig_meta).get("files", {})
         for role, name in files.items():
             if role == "bin":
