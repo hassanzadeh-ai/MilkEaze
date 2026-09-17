@@ -2,8 +2,8 @@ import numpy as np
 import pytest
 
 from milkeaze.eval.baselines import (
-    STRAIN_POLARITY, fit_ridge, in_band_power_fraction, mean_predictor_scores,
-    most_rhythmic_channel, regression_scores, strain_consensus_events,
+    STRAIN_POLARITY, acoustic_envelope, acoustic_rate_cpm, fit_ridge, in_band_power_fraction,
+    mean_predictor_scores, most_rhythmic_channel, regression_scores, strain_consensus_events,
     strain_consensus_signal, strain_event_baseline, strain_event_candidates,
     strain_rate_cpm,
 )
@@ -17,6 +17,43 @@ def _rhythmic(duration_s=60.0, rate_cpm=RATE_CPM, amplitude=1.0, seed=0):
     t = np.arange(int(duration_s * FS)) / FS
     signal = amplitude * np.sin(2 * np.pi * (rate_cpm / 60.0) * t)
     return t * 1000.0, signal + rng.normal(0, 0.02 * amplitude, t.size)
+
+
+AUDIO_FS = 2000.0
+
+
+def _modulated_noise(duration_s=120.0, rate_cpm=RATE_CPM, seed=0):
+    """Broadband noise whose loudness rises and falls once per suck.
+
+    Deliberately carries no tone at the suck rate: the rate is only present as amplitude
+    modulation, which is the property the envelope has to recover.
+    """
+    rng = np.random.default_rng(seed)
+    t = np.arange(int(duration_s * AUDIO_FS)) / AUDIO_FS
+    gain = 1.0 + 0.8 * np.sin(2 * np.pi * (rate_cpm / 60.0) * t)
+    return rng.normal(0, 1.0, t.size) * gain
+
+
+def test_acoustic_rate_recovers_a_modulation_with_no_tone_at_that_rate():
+    signal = _modulated_noise(rate_cpm=48.0)
+    assert acoustic_rate_cpm(signal, AUDIO_FS) == pytest.approx(48.0, abs=2.5)
+
+
+def test_acoustic_envelope_decimates_to_about_the_requested_rate():
+    env, env_fs = acoustic_envelope(_modulated_noise(duration_s=30.0), AUDIO_FS)
+    assert env_fs == pytest.approx(50.0, rel=0.1)
+    assert env.size == pytest.approx(30.0 * env_fs, rel=0.05)
+    assert np.all(env >= 0)  # it is an RMS
+
+
+def test_acoustic_rate_refuses_a_capture_too_short_to_estimate_from():
+    """Better a NaN than a rate built from a handful of envelope samples."""
+    assert np.isnan(acoustic_rate_cpm(np.zeros(100), AUDIO_FS))
+
+
+def test_acoustic_envelope_rejects_a_stereo_block():
+    with pytest.raises(ValueError, match="one channel"):
+        acoustic_envelope(np.zeros((1000, 2)), AUDIO_FS)
 
 
 def test_ridge_recovers_a_linear_relationship():

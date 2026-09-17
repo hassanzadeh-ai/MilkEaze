@@ -26,10 +26,11 @@ Three questions, one module each:
 from __future__ import annotations
 
 from .baselines import (
-    STRAIN_POLARITY, RegressionScores, RidgeRegressor, fit_ridge, in_band_power_fraction,
-    mean_predictor_scores, most_rhythmic_channel, regression_scores,
-    strain_consensus_events, strain_consensus_signal, strain_event_baseline,
-    strain_event_candidates, strain_rate_cpm,
+    ACOUSTIC_ENV_HZ, STRAIN_POLARITY, RegressionScores, RidgeRegressor, acoustic_envelope,
+    acoustic_rate_cpm, fit_ridge, in_band_power_fraction, mean_predictor_scores,
+    most_rhythmic_channel, regression_scores, strain_consensus_events,
+    strain_consensus_signal, strain_event_baseline, strain_event_candidates,
+    strain_rate_cpm,
 )
 from .confound import ConfoundProbe, condition_correlations, nearest_centroid_cv, spearman
 from .events import EventMatch, match_events, rate_cpm, tolerance_from_period
@@ -42,6 +43,7 @@ from .windows import (
 )
 
 __all__ = [
+    "ACOUSTIC_ENV_HZ",
     "STRAIN_POLARITY",
     "ConfoundProbe",
     "EventMatch",
@@ -49,6 +51,8 @@ __all__ = [
     "LabelGranularity",
     "RegressionScores",
     "RidgeRegressor",
+    "acoustic_envelope",
+    "acoustic_rate_cpm",
     "class_balance",
     "condition_correlations",
     "fill_response",

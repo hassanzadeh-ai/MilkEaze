@@ -280,6 +280,52 @@ def strain_consensus_signal(strain_block: np.ndarray, fs: float, channels: list[
     return np.mean(centred / scale * -signs[healthy], axis=1)
 
 
+#: Envelope rate after block-averaging. The suck band tops out at 1.5 Hz, so this is far
+#: above what a rate estimate needs and keeps the spectrum cheap on an audio-rate stream.
+ACOUSTIC_ENV_HZ = 50.0
+
+
+def acoustic_envelope(signal: np.ndarray, fs: float,
+                      env_hz: float = ACOUSTIC_ENV_HZ) -> tuple[np.ndarray, float]:
+    """Short-term RMS of an audio channel, and the rate it comes back at.
+
+    The cycle is carried by how the energy is modulated, not by any tone: the microphone
+    hears each suck as a burst of broadband noise. Squaring and block-averaging recovers
+    that modulation and discards the carrier, which also drops the sample count by two
+    orders of magnitude before anything has to run a spectrum over it.
+
+    Returns an empty array when the capture is too short to hold enough envelope samples
+    to estimate anything from, rather than returning a number built from a handful.
+    """
+    x = np.asarray(signal, dtype=np.float64)
+    if x.ndim != 1:
+        raise ValueError(f"expected one channel, got shape {x.shape}")
+    x = x - x.mean()
+
+    block = max(int(round(fs / env_hz)), 1)
+    n = (len(x) // block) * block
+    if n < block * 8:
+        return np.empty(0, dtype=np.float64), float("nan")
+
+    energy = (x[:n] ** 2).reshape(-1, block).mean(axis=1)
+    return np.sqrt(energy), fs / block
+
+
+def acoustic_rate_cpm(signal: np.ndarray, fs: float,
+                      band_cpm: tuple[float, float] = (18.0, 90.0)) -> float:
+    """Suck rate from one microphone channel alone.
+
+    A third independent path to rate, beside the strain ring and the IMU. Independence is
+    the point rather than accuracy: the ring is the part that keeps failing in the field,
+    and a rate that survives its loss is worth more than a marginally better estimate
+    that does not.
+    """
+    env, env_fs = acoustic_envelope(signal, fs)
+    if env.size == 0:
+        return float("nan")
+    return estimate_cycle_rate_cpm(env, env_fs, band_cpm)
+
+
 def strain_consensus_events(t_ms: np.ndarray, strain_block: np.ndarray,
                             channels: list[str], config: DetectorConfig | None = None,
                             polarity: dict[str, int] | None = None,
